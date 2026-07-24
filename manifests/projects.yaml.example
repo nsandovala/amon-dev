@@ -1,0 +1,63 @@
+machine: pc-wsl2
+root: /home/nsand/amon-dev/repos
+
+projects:
+  tbb-amon-delivery-dev:
+    path: /home/nsand/amon-dev/repos/tbb-amon-delivery-dev
+    runtime: node@20
+    manager: npm
+    start: npm run dev:all
+    doctor: npm --prefix packages/shared run typecheck
+    ports: [3000, 3001, 4000, 5001, 8080, 9099]
+    env_required: [FIREBASE_PROJECT_ID]
+    status: "ready:lint-warning(apps/web ESLint config missing)"
+
+  bracketflow:
+    path: /home/nsand/amon-dev/repos/bracketflow
+    runtime: node@20
+    manager: npm
+    start: npm --prefix app/frontend run dev
+    doctor: npm --prefix app/frontend run lint
+    ports: [3000, 8000]
+    env_required: []
+    status: ready
+
+  amon-agents:
+    path: /home/nsand/amon-dev/repos/amon-agents
+    runtime: node@20
+    manager: npm
+    start: npm run start
+    doctor: npm run amon -- doctor
+    ports: []
+    env_required: []
+    status: ready
+
+  sentinel-board:
+    path: /home/nsand/amon-dev/repos/sentinel-board
+    runtime: node@20
+    manager: npm
+    start: npm run dev
+    doctor: npm run lint
+    ports: [3000]
+    env_required: [DATABASE_URL]
+    status: "ready:lint-warning(ESLint errors pending)"
+
+  minilib:
+    path: /home/nsand/amon-dev/repos/minilib
+    runtime: node@20
+    manager: npm
+    start: npm run dev
+    doctor: npm run typecheck
+    ports: [3000]
+    env_required: [DATABASE_URL, NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY, CLERK_SECRET_KEY]
+    status: "blocked:lint requires undeclared eslint dependency"
+
+  amon_erp:
+    path: /home/nsand/amon-dev/repos/amon_erp
+    runtime: python@3.12
+    manager: pip
+    start: .venv/bin/flask --app app run --debug
+    doctor: '.venv/bin/python -c "import flask; print(flask.__version__)"'
+    ports: [5000]
+    env_required: []
+    status: ready
