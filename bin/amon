@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+AMON_SOURCE=$0
+while [ -h "$AMON_SOURCE" ]; do
+  AMON_SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$AMON_SOURCE")" && pwd)
+  AMON_LINK=$(readlink "$AMON_SOURCE")
+  case "$AMON_LINK" in
+    /*) AMON_SOURCE=$AMON_LINK ;;
+    *) AMON_SOURCE=$AMON_SOURCE_DIR/$AMON_LINK ;;
+  esac
+done
+
+AMON_BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$AMON_SOURCE")" && pwd)
+AMON_ROOT=$(CDPATH= cd -- "$AMON_BIN_DIR/.." && pwd)
+AMON_MANIFEST=${AMON_MANIFEST:-"$AMON_ROOT/manifests/projects.yaml"}
+AMON_STATE_DIR=${AMON_STATE_DIR:-"$HOME/.amon"}
+AMON_RUN_DIR="$AMON_STATE_DIR/run"
+AMON_LOG_DIR="$AMON_STATE_DIR/log"
+AMON_EVENTS_FILE="$AMON_STATE_DIR/events.jsonl"
+
+# shellcheck source=../lib/output.sh
+. "$AMON_ROOT/lib/output.sh"
+# shellcheck source=../lib/manifest.sh
+. "$AMON_ROOT/lib/manifest.sh"
+# shellcheck source=../lib/checks.sh
+. "$AMON_ROOT/lib/checks.sh"
+
+output_init
+
+usage() {
+  cat <<'USAGE'
+Uso: amon <comando> [argumentos]
+
+CLI del workspace Developer OS.
+
+Comandos:
+  ls                         Lista los proyectos del manifiesto
+  doctor [proyecto]          Diagnostica el workspace y, opcionalmente, un proyecto
+  open <proyecto>            Prepara un proyecto sin arrancarlo
+  start <proyecto>           Arranca el comando declarado mediante mise
+  stop <proyecto>            Detiene un proyecto gestionado por amon
+  stop --all                 Detiene todos los proyectos gestionados por amon
+  ports                      Muestra puertos declarados, uso y conflictos
+  status                     Muestra procesos gestionados que siguen vivos
+  gaming                     Libera modelos Ollama y detiene todos los proyectos
+  help                       Muestra esta ayuda
+
+Variables:
+  AMON_MANIFEST              Ruta alternativa al projects.yaml
+  AMON_STATE_DIR             Estado local (por defecto: ~/.amon)
+  NO_COLOR                   Desactiva colores
+USAGE
+}
+
+die_usage() {
+  out_error "$1"
+  printf '\n' >&2
+  usage >&2
+  return 2
+}
+
+require_manifest() {
+  manifest_require_yq || return 1
+  if [ ! -f "$AMON_MANIFEST" ]; then
+    out_error "Manifiesto no encontrado: $AMON_MANIFEST"
+    return 1
+  fi
+  if ! manifest_validate; then
+    out_error "Manifiesto inválido: $AMON_MANIFEST"
+    return 1
+  fi
+}
+
+require_project() {
+  local slug=$1
+  require_manifest || return 1
+  if ! manifest_project_exists "$slug"; then
+    out_error "Proyecto no encontrado en el manifiesto: $slug"
+    return 1
+  fi
+}
+
+ensure_state_dirs() {
+  umask 077
+  mkdir -p "$AMON_RUN_DIR" "$AMON_LOG_DIR"
+}
+
+json_escape() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+record_event() {
+  local command_name=$1
+  local project=$2
+  local result=$3
+  local timestamp
+
+  ensure_state_dirs
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  printf '{"timestamp":"%s","command":"%s","project":"%s","result":"%s"}\n' \
+    "$(json_escape "$timestamp")" \
+    "$(json_escape "$command_name")" \
+    "$(json_escape "$project")" \
+    "$(json_escape "$result")" >>"$AMON_EVENTS_FILE"
+}
+
+cmd_ls() {
+  local slug
+  local runtime
+  local manager
+  local ports
+  local project_status
+
+  require_manifest || return 1
+  printf '%-24s %-12s %-9s %-25s %s\n' \
+    "SLUG" "RUNTIME" "GESTOR" "PUERTOS" "STATUS"
+  printf '%-24s %-12s %-9s %-25s %s\n' \
+    "------------------------" "------------" "---------" "-------------------------" "------"
+
+  while IFS= read -r slug; do
+    runtime=$(manifest_project_field "$slug" runtime)
+    manager=$(manifest_project_field "$slug" manager)
+    ports=$(manifest_project_ports_csv "$slug")
+    project_status=$(manifest_project_field "$slug" status)
+    [ -n "$ports" ] || ports="-"
+
+    printf '%-24s %-12s %-9s %-25s ' "$slug" "$runtime" "$manager" "$ports"
+    case "$project_status" in
+      blocked:*) out_blocked_status "${project_status#blocked:}" ;;
+      *) printf '%s' "$project_status" ;;
+    esac
+    printf '\n'
+  done < <(manifest_list_projects)
+}
+
+cmd_doctor() {
+  local slug=${1:-}
+  doctor_run "$slug"
+}
+
+cmd_open() {
+  local slug=$1
+  local path
+  local runtime
+  local start_command
+  local ports
+
+  require_project "$slug" || return 1
+  if ! doctor_run "$slug"; then
+    out_fail "El proyecto no está listo; corrige los FAIL antes de iniciarlo"
+    return 1
+  fi
+
+  path=$(manifest_project_field "$slug" path)
+  runtime=$(manifest_project_field "$slug" runtime)
+  start_command=$(manifest_project_field "$slug" start)
+  ports=$(manifest_project_ports_csv "$slug")
+  [ -n "$ports" ] || ports="-"
+
+  printf '\n'
+  out_heading "Preparación: $slug"
+  printf 'Ruta:     %s\n' "$path"
+  printf 'Runtime:  %s\n' "$runtime"
+  printf 'Start:    %s\n' "$start_command"
+  printf 'Puertos:  %s\n' "$ports"
+  printf 'Entrar:   cd %q\n' "$path"
+  printf '\nListo. Para iniciar: amon start %s\n' "$slug"
+}
+
+pid_is_alive() {
+  local pid=$1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+cmd_start() {
+  local slug=$1
+  local path
+  local runtime
+  local start_command
+  local pid_file
+  local log_file
+  local old_pid
+  local pid
+
+  require_project "$slug" || return 1
+  if ! doctor_run "$slug"; then
+    record_event "start" "$slug" "aborted-doctor-fail"
+    out_fail "Inicio abortado por fallos de doctor"
+    return 1
+  fi
+
+  ensure_state_dirs
+  pid_file="$AMON_RUN_DIR/$slug.pid"
+  log_file="$AMON_LOG_DIR/$slug.log"
+
+  if [ -f "$pid_file" ]; then
+    IFS= read -r old_pid <"$pid_file"
+    if [[ "$old_pid" =~ ^[0-9]+$ ]] && pid_is_alive "$old_pid"; then
+      out_error "$slug ya está corriendo con PID $old_pid"
+      record_event "start" "$slug" "already-running:$old_pid"
+      return 1
+    fi
+    rm -f "$pid_file"
+  fi
+
+  path=$(manifest_project_field "$slug" path)
+  runtime=$(manifest_project_field "$slug" runtime)
+  start_command=$(manifest_project_field "$slug" start)
+
+  (
+    cd "$path" || exit 125
+    if command -v setsid >/dev/null 2>&1; then
+      exec nohup setsid mise exec "$runtime" -- bash -lc "exec $start_command"
+    fi
+    exec nohup mise exec "$runtime" -- bash -lc "exec $start_command"
+  ) </dev/null >>"$log_file" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" >"$pid_file"
+
+  sleep 2
+  if ! pid_is_alive "$pid"; then
+    rm -f "$pid_file"
+    record_event "start" "$slug" "failed-early"
+    out_fail "El proceso terminó durante el arranque. Revisa: $log_file"
+    return 1
+  fi
+
+  record_event "start" "$slug" "started:$pid"
+  out_ok "$slug iniciado"
+  printf 'PID: %s\n' "$pid"
+  printf 'Log: %s\n' "$log_file"
+}
+
+collect_descendants() {
+  local parent=$1
+  local child
+
+  command -v pgrep >/dev/null 2>&1 || return 0
+  for child in $(pgrep -P "$parent" 2>/dev/null); do
+    collect_descendants "$child"
+    printf '%s\n' "$child"
+  done
+}
+
+stop_process_tree() {
+  local pid=$1
+  local descendants
+  local child
+  local attempt
+  local alive
+
+  descendants=$(collect_descendants "$pid")
+  for child in $descendants; do
+    kill -TERM "$child" >/dev/null 2>&1 || true
+  done
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+
+  attempt=0
+  while [ "$attempt" -lt 50 ]; do
+    alive=0
+    if pid_is_alive "$pid"; then
+      alive=1
+    fi
+    for child in $descendants; do
+      if pid_is_alive "$child"; then
+        alive=1
+      fi
+    done
+    [ "$alive" -eq 0 ] && return 0
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+
+  for child in $descendants; do
+    kill -KILL "$child" >/dev/null 2>&1 || true
+  done
+  kill -KILL "$pid" >/dev/null 2>&1 || true
+  sleep 0.2
+}
+
+verify_project_ports_free() {
+  local slug=$1
+  local port
+  local failed=0
+
+  while IFS= read -r port; do
+    [ -n "$port" ] || continue
+    if port_is_listening "$port"; then
+      out_fail "Puerto $port continúa ocupado"
+      failed=1
+    else
+      out_ok "Puerto $port libre"
+    fi
+  done < <(manifest_project_array "$slug" ports)
+
+  return "$failed"
+}
+
+stop_one() {
+  local slug=$1
+  local pid_file
+  local pid
+  local result
+
+  require_project "$slug" || return 1
+  ensure_state_dirs
+  pid_file="$AMON_RUN_DIR/$slug.pid"
+
+  if [ ! -f "$pid_file" ]; then
+    out_warn "$slug no tiene PID registrado"
+    record_event "stop" "$slug" "not-running"
+    return 0
+  fi
+
+  IFS= read -r pid <"$pid_file"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    rm -f "$pid_file"
+    out_fail "PID inválido eliminado para $slug"
+    record_event "stop" "$slug" "invalid-pid-cleaned"
+    return 1
+  fi
+
+  if pid_is_alive "$pid"; then
+    stop_process_tree "$pid"
+    result="stopped:$pid"
+    out_ok "$slug detenido (PID $pid)"
+  else
+    result="stale-pid-cleaned:$pid"
+    out_warn "$slug tenía un PID muerto; se limpió"
+  fi
+
+  # TODO(database-manifest): ejecutar PRAGMA wal_checkpoint(TRUNCATE) aquí
+  # cuando el manifiesto declare bases de datos SQLite para el proyecto.
+
+  rm -f "$pid_file"
+  sleep 1
+  if verify_project_ports_free "$slug"; then
+    record_event "stop" "$slug" "$result"
+    return 0
+  fi
+
+  record_event "stop" "$slug" "$result:ports-still-used"
+  return 1
+}
+
+cmd_stop_all() {
+  local pid_file
+  local slug
+  local found=0
+  local failed=0
+
+  require_manifest || return 1
+  ensure_state_dirs
+
+  for pid_file in "$AMON_RUN_DIR"/*.pid; do
+    [ -e "$pid_file" ] || continue
+    found=1
+    slug=$(basename "$pid_file" .pid)
+    if manifest_project_exists "$slug"; then
+      stop_one "$slug" || failed=1
+    else
+      out_warn "PID desconocido conservado: $pid_file"
+      failed=1
+    fi
+  done
+
+  if [ "$found" -eq 0 ]; then
+    out_ok "No hay procesos registrados"
+    record_event "stop --all" "*" "nothing-running"
+  fi
+  return "$failed"
+}
+
+cmd_ports() {
+  local tmp_file
+  local slug
+  local port
+  local projects
+  local count
+  local usage
+
+  require_manifest || return 1
+  tmp_file=$(mktemp "${TMPDIR:-/tmp}/amon-ports.XXXXXX") || return 1
+
+  while IFS= read -r slug; do
+    while IFS= read -r port; do
+      [ -n "$port" ] && printf '%s|%s\n' "$port" "$slug" >>"$tmp_file"
+    done < <(manifest_project_array "$slug" ports)
+  done < <(manifest_list_projects)
+
+  printf '%-8s %-42s %-8s %s\n' "PUERTO" "PROYECTOS" "EN_USO" "ESTADO"
+  printf '%-8s %-42s %-8s %s\n' "--------" "------------------------------------------" "--------" "--------"
+
+  while IFS= read -r port; do
+    projects=$(awk -F'|' -v wanted="$port" '$1 == wanted { print $2 }' "$tmp_file" |
+      paste -sd, -)
+    count=$(awk -F'|' -v wanted="$port" '$1 == wanted { count++ } END { print count + 0 }' "$tmp_file")
+    if port_is_listening "$port"; then
+      usage="sí"
+    else
+      usage="no"
+    fi
+
+    if [ "$count" -gt 1 ]; then
+      out_conflict_row "$port" "$projects" "$usage"
+    else
+      printf '%-8s %-42s %-8s %s\n' "$port" "$projects" "$usage" "ok"
+    fi
+  done < <(cut -d'|' -f1 "$tmp_file" | sort -n | uniq)
+
+  rm -f "$tmp_file"
+}
+
+list_listening_ports() {
+  local slug=$1
+  local port
+  local result=
+
+  while IFS= read -r port; do
+    [ -n "$port" ] || continue
+    if port_is_listening "$port"; then
+      if [ -n "$result" ]; then
+        result="$result,$port"
+      else
+        result=$port
+      fi
+    fi
+  done < <(manifest_project_array "$slug" ports)
+
+  [ -n "$result" ] || result="-"
+  printf '%s' "$result"
+}
+
+cmd_status() {
+  local pid_file
+  local slug
+  local pid
+  local ports
+  local found=0
+
+  require_manifest || return 1
+  ensure_state_dirs
+  printf '%-24s %-10s %s\n' "PROYECTO" "PID" "PUERTOS_ESCUCHANDO"
+  printf '%-24s %-10s %s\n' "------------------------" "----------" "-------------------"
+
+  for pid_file in "$AMON_RUN_DIR"/*.pid; do
+    [ -e "$pid_file" ] || continue
+    slug=$(basename "$pid_file" .pid)
+    IFS= read -r pid <"$pid_file"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && pid_is_alive "$pid"; then
+      if manifest_project_exists "$slug"; then
+        ports=$(list_listening_ports "$slug")
+      else
+        ports="-"
+      fi
+      printf '%-24s %-10s %s\n' "$slug" "$pid" "$ports"
+      found=1
+    else
+      rm -f "$pid_file"
+      out_warn "PID muerto limpiado: $slug"
+    fi
+  done
+
+  if [ "$found" -eq 0 ]; then
+    printf '(sin procesos gestionados)\n'
+  fi
+}
+
+release_ollama_models() {
+  local response
+  local model
+  local payload
+  local released=0
+
+  if ! command -v curl >/dev/null 2>&1; then
+    out_warn "curl no está disponible; no se pudo consultar Ollama"
+    return 0
+  fi
+  if ! response=$(curl -fsS --max-time 3 http://localhost:11434/api/ps 2>/dev/null); then
+    out_warn "Ollama no está alcanzable; liberación no comprobable [PENDIENTE VERIFICAR]"
+    return 0
+  fi
+
+  while IFS= read -r model; do
+    [ -n "$model" ] || continue
+    payload=$(MODEL_NAME="$model" yq eval -n -o=json \
+      '{"model": strenv(MODEL_NAME), "keep_alive": 0}')
+    if curl -fsS --max-time 10 \
+      -H 'Content-Type: application/json' \
+      -d "$payload" http://localhost:11434/api/generate >/dev/null 2>&1; then
+      out_ok "Modelo Ollama descargado de VRAM: $model"
+      released=$((released + 1))
+    else
+      out_warn "No se pudo descargar el modelo Ollama: $model"
+    fi
+  done < <(printf '%s' "$response" | yq eval -p=json -r '.models[].name // ""' -)
+
+  if [ "$released" -eq 0 ]; then
+    out_ok "No había modelos Ollama cargados"
+  fi
+}
+
+cmd_gaming() {
+  local failed=0
+
+  require_manifest || return 1
+  out_heading "Liberando recursos para gaming"
+  release_ollama_models
+  cmd_stop_all || failed=1
+
+  if [ "$failed" -eq 0 ]; then
+    out_ok "Recursos gestionados por amon liberados"
+  else
+    out_fail "Quedaron recursos por revisar"
+  fi
+  return "$failed"
+}
+
+main() {
+  local command_name=${1:-help}
+  [ "$#" -eq 0 ] || shift
+
+  # TODO(amon-agents): agregar aquí la delegación porcelain/plumbing cuando un
+  # ticket futuro defina comandos como audit/scan. No implementarlos en este CLI.
+
+  case "$command_name" in
+    help|-h|--help)
+      [ "$#" -eq 0 ] || die_usage "help no acepta argumentos"
+      usage
+      ;;
+    ls)
+      [ "$#" -eq 0 ] || die_usage "ls no acepta argumentos"
+      cmd_ls
+      ;;
+    doctor)
+      [ "$#" -le 1 ] || die_usage "doctor acepta como máximo un proyecto"
+      cmd_doctor "${1:-}"
+      ;;
+    open)
+      [ "$#" -eq 1 ] || die_usage "open requiere un proyecto"
+      cmd_open "$1"
+      ;;
+    start)
+      [ "$#" -eq 1 ] || die_usage "start requiere un proyecto"
+      cmd_start "$1"
+      ;;
+    stop)
+      [ "$#" -eq 1 ] || die_usage "stop requiere un proyecto o --all"
+      if [ "$1" = "--all" ]; then
+        cmd_stop_all
+      else
+        stop_one "$1"
+      fi
+      ;;
+    ports)
+      [ "$#" -eq 0 ] || die_usage "ports no acepta argumentos"
+      cmd_ports
+      ;;
+    status)
+      [ "$#" -eq 0 ] || die_usage "status no acepta argumentos"
+      cmd_status
+      ;;
+    gaming)
+      [ "$#" -eq 0 ] || die_usage "gaming no acepta argumentos"
+      cmd_gaming
+      ;;
+    *)
+      die_usage "comando desconocido: $command_name"
+      ;;
+  esac
+}
+
+main "$@"
