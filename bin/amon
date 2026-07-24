@@ -20,6 +20,8 @@ AMON_STATE_DIR=${AMON_STATE_DIR:-"$HOME/.amon"}
 AMON_RUN_DIR="$AMON_STATE_DIR/run"
 AMON_LOG_DIR="$AMON_STATE_DIR/log"
 AMON_EVENTS_FILE="$AMON_STATE_DIR/events.jsonl"
+AMON_GAMING_SNAPSHOT="$AMON_STATE_DIR/pre-gaming-snapshot.json"
+AMON_GAMING_SNAPSHOT_CONSUMED="$AMON_GAMING_SNAPSHOT.consumed"
 
 # shellcheck source=../lib/output.sh
 . "$AMON_ROOT/lib/output.sh"
@@ -51,7 +53,8 @@ Comandos:
   scan <proyecto> [args]     Delega escaneo en amon-agents
   agents:status              Muestra el estado global de amon-agents
   agents:doctor              Diagnostica el entorno de agentes IA
-  gaming                     Libera modelos Ollama y detiene todos los proyectos
+  gaming                     Recuerda procesos, libera Ollama y los detiene
+  dev                        Restaura el último estado previo a gaming
   help                       Muestra esta ayuda
 
 Variables:
@@ -481,6 +484,63 @@ cmd_status() {
   fi
 }
 
+write_slug_array_file() {
+  local target=$1
+  local temp_file
+  local slug
+  local separator=
+  shift
+
+  ensure_state_dirs
+  temp_file=$(mktemp "$AMON_STATE_DIR/.amon-snapshot.XXXXXX") || {
+    out_error "No se pudo crear el archivo temporal del snapshot"
+    return 1
+  }
+
+  printf '[' >"$temp_file"
+  for slug in "$@"; do
+    printf '%s"%s"' "$separator" "$(json_escape "$slug")" >>"$temp_file"
+    separator=,
+  done
+  printf ']\n' >>"$temp_file"
+
+  if ! mv -f "$temp_file" "$target"; then
+    rm -f "$temp_file"
+    out_error "No se pudo escribir el snapshot: $target"
+    return 1
+  fi
+}
+
+snapshot_running_projects() {
+  local pid_file
+  local slug
+  local pid
+  local running_slugs=()
+
+  ensure_state_dirs
+  for pid_file in "$AMON_RUN_DIR"/*.pid; do
+    [ -e "$pid_file" ] || continue
+    slug=$(basename "$pid_file" .pid)
+    pid=
+    IFS= read -r pid <"$pid_file"
+
+    if [[ "$pid" =~ ^[0-9]+$ ]] && pid_is_alive "$pid"; then
+      if manifest_project_exists "$slug"; then
+        running_slugs[${#running_slugs[@]}]=$slug
+      else
+        out_warn "PID vivo no incluido; proyecto fuera del manifiesto: $slug"
+      fi
+    else
+      rm -f "$pid_file"
+      out_warn "PID muerto limpiado antes del snapshot: $slug"
+    fi
+  done
+
+  write_slug_array_file "$AMON_GAMING_SNAPSHOT" "${running_slugs[@]}" || return 1
+  GAMING_SNAPSHOT_COUNT=${#running_slugs[@]}
+  out_ok "Snapshot pre-gaming escrito: $AMON_GAMING_SNAPSHOT ($GAMING_SNAPSHOT_COUNT proyectos)"
+}
+
 release_ollama_models() {
   local response
   local model
@@ -520,15 +580,106 @@ cmd_gaming() {
 
   require_manifest || return 1
   out_heading "Liberando recursos para gaming"
+  if ! snapshot_running_projects; then
+    record_event "gaming" "*" "snapshot-failed"
+    out_fail "Gaming abortado: no se detendrán procesos sin guardar el snapshot"
+    return 1
+  fi
+
   release_ollama_models
   cmd_stop_all || failed=1
 
   if [ "$failed" -eq 0 ]; then
+    record_event "gaming" "*" "ok:snapshot=$GAMING_SNAPSHOT_COUNT"
     out_ok "Recursos gestionados por amon liberados"
   else
+    record_event "gaming" "*" "partial:snapshot=$GAMING_SNAPSHOT_COUNT"
     out_fail "Quedaron recursos por revisar"
   fi
   return "$failed"
+}
+
+cmd_dev() {
+  local slug
+  local exit_code
+  local restored=0
+  local failed=0
+  local snapshot_count
+  local snapshot_slugs=()
+  local failed_slugs=()
+  local failed_results=()
+  local index
+
+  require_manifest || return 1
+  ensure_state_dirs
+
+  if [ ! -f "$AMON_GAMING_SNAPSHOT" ]; then
+    out_ok "No hay snapshot previo; nada que restaurar"
+    record_event "dev" "*" "no-snapshot"
+    return 0
+  fi
+
+  if ! yq eval -e 'type == "!!seq"' "$AMON_GAMING_SNAPSHOT" >/dev/null 2>&1; then
+    out_fail "Snapshot inválido: se esperaba un array JSON"
+    record_event "dev" "*" "invalid-snapshot"
+    return 1
+  fi
+
+  snapshot_count=$(yq eval -r 'length' "$AMON_GAMING_SNAPSHOT")
+  if [ "$snapshot_count" -eq 0 ]; then
+    out_ok "El snapshot indica que no había nada corriendo antes de gaming"
+    if mv -f "$AMON_GAMING_SNAPSHOT" "$AMON_GAMING_SNAPSHOT_CONSUMED"; then
+      record_event "dev" "*" "empty-snapshot"
+      return 0
+    fi
+    out_fail "No se pudo consumir el snapshot vacío"
+    record_event "dev" "*" "consume-failed"
+    return 1
+  fi
+
+  while IFS= read -r slug; do
+    snapshot_slugs[${#snapshot_slugs[@]}]=$slug
+  done < <(yq eval -r '.[]' "$AMON_GAMING_SNAPSHOT")
+
+  out_heading "Restaurando estado previo a gaming"
+  for slug in "${snapshot_slugs[@]}"; do
+    printf '\nRestaurando: %s\n' "$slug"
+    cmd_start "$slug"
+    exit_code=$?
+    if [ "$exit_code" -eq 0 ]; then
+      restored=$((restored + 1))
+    else
+      failed_slugs[${#failed_slugs[@]}]=$slug
+      failed_results[${#failed_results[@]}]=$exit_code
+      failed=$((failed + 1))
+    fi
+  done
+
+  printf '\n'
+  out_heading "Resumen dev"
+  printf 'Restaurados OK: %s\n' "$restored"
+  printf 'Fallidos:       %s\n' "$failed"
+  if [ "$failed" -gt 0 ]; then
+    index=0
+    while [ "$index" -lt "${#failed_slugs[@]}" ]; do
+      printf '  - %s: cmd_start terminó con exit %s; revisa el FAIL anterior\n' \
+        "${failed_slugs[$index]}" "${failed_results[$index]}"
+      index=$((index + 1))
+    done
+    write_slug_array_file "$AMON_GAMING_SNAPSHOT" "${failed_slugs[@]}" || true
+    out_warn "Snapshot conservado solo con los proyectos fallidos para reintento"
+    record_event "dev" "*" "partial:restored=$restored,failed=$failed"
+    return 1
+  fi
+
+  if ! mv -f "$AMON_GAMING_SNAPSHOT" "$AMON_GAMING_SNAPSHOT_CONSUMED"; then
+    out_fail "Los proyectos arrancaron, pero no se pudo consumir el snapshot"
+    record_event "dev" "*" "consume-failed:restored=$restored"
+    return 1
+  fi
+
+  record_event "dev" "*" "ok:restored=$restored"
+  out_ok "Snapshot consumido; no se repetirá este restore"
 }
 
 main() {
@@ -596,6 +747,10 @@ main() {
     gaming)
       [ "$#" -eq 0 ] || die_usage "gaming no acepta argumentos"
       cmd_gaming
+      ;;
+    dev)
+      [ "$#" -eq 0 ] || die_usage "dev no acepta argumentos"
+      cmd_dev
       ;;
     *)
       die_usage "comando desconocido: $command_name"

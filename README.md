@@ -171,11 +171,33 @@ Diagnosticar el entorno de agentes IA:
 amon agents:doctor
 ```
 
-Liberar modelos cargados por Ollama y detener todos los procesos gestionados por
-`amon`, sin tocar juegos, Windows ni servicios del sistema:
+Pausar el entorno de desarrollo para jugar:
 
 ```bash
 amon gaming
+```
+
+`gaming` guarda en `~/.amon/pre-gaming-snapshot.json` los slugs de los proyectos
+gestionados que estaban corriendo, libera los modelos cargados por Ollama y
+detiene esos procesos. El snapshot siempre se escribe, incluso cuando está vacío.
+No toca juegos, Windows ni servicios del sistema.
+
+Restaurar el último estado previo a `gaming`:
+
+```bash
+amon dev
+```
+
+`dev` vuelve a ejecutar `cmd_start` para cada proyecto del snapshot, incluyendo
+sus chequeos de `doctor`. Continúa si alguno falla y muestra un resumen. Si todos
+arrancan, mueve el snapshot a `.consumed`, por lo que un segundo `amon dev` no
+repite el arranque accidentalmente.
+
+El ciclo completo es:
+
+```text
+amon gaming  →  recuerda y pausa
+amon dev     →  restaura y consume el snapshot
 ```
 
 Mostrar ayuda:
@@ -189,6 +211,7 @@ amon help
 - PIDs: `~/.amon/run/<proyecto>.pid`
 - Logs: `~/.amon/log/<proyecto>.log`
 - Eventos append-only: `~/.amon/events.jsonl`
+- Snapshot pre-gaming: `~/.amon/pre-gaming-snapshot.json`
 - Las delegaciones registran `agents:<comando>`, slug y resultado en el mismo
   archivo de eventos.
 - `AMON_STATE_DIR` permite usar otra ubicación de estado.
