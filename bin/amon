@@ -27,6 +27,8 @@ AMON_EVENTS_FILE="$AMON_STATE_DIR/events.jsonl"
 . "$AMON_ROOT/lib/manifest.sh"
 # shellcheck source=../lib/checks.sh
 . "$AMON_ROOT/lib/checks.sh"
+# shellcheck source=../lib/delegate.sh
+. "$AMON_ROOT/lib/delegate.sh"
 
 output_init
 
@@ -45,6 +47,10 @@ Comandos:
   stop --all                 Detiene todos los proyectos gestionados por amon
   ports                      Muestra puertos declarados, uso y conflictos
   status                     Muestra procesos gestionados que siguen vivos
+  audit <proyecto> [args]    Delega auditoría en amon-agents
+  scan <proyecto> [args]     Delega escaneo en amon-agents
+  agents:status              Muestra el estado global de amon-agents
+  agents:doctor              Diagnostica el entorno de agentes IA
   gaming                     Libera modelos Ollama y detiene todos los proyectos
   help                       Muestra esta ayuda
 
@@ -527,10 +533,8 @@ cmd_gaming() {
 
 main() {
   local command_name=${1:-help}
+  local slug
   [ "$#" -eq 0 ] || shift
-
-  # TODO(amon-agents): agregar aquí la delegación porcelain/plumbing cuando un
-  # ticket futuro defina comandos como audit/scan. No implementarlos en este CLI.
 
   case "$command_name" in
     help|-h|--help)
@@ -568,6 +572,26 @@ main() {
     status)
       [ "$#" -eq 0 ] || die_usage "status no acepta argumentos"
       cmd_status
+      ;;
+    audit)
+      [ "$#" -ge 1 ] || die_usage "audit requiere un proyecto"
+      slug=$1
+      shift
+      delegate_to_agents audit "$slug" "$@"
+      ;;
+    scan)
+      [ "$#" -ge 1 ] || die_usage "scan requiere un proyecto"
+      slug=$1
+      shift
+      delegate_to_agents scan "$slug" "$@"
+      ;;
+    agents:status)
+      [ "$#" -eq 0 ] || die_usage "agents:status no acepta argumentos"
+      delegate_to_agents status
+      ;;
+    agents:doctor)
+      [ "$#" -eq 0 ] || die_usage "agents:doctor no acepta argumentos"
+      delegate_to_agents doctor
       ;;
     gaming)
       [ "$#" -eq 0 ] || die_usage "gaming no acepta argumentos"

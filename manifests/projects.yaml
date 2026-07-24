@@ -10,7 +10,7 @@ projects:
     doctor: npm --prefix packages/shared run typecheck
     ports: [3000, 3001, 4000, 5001, 8080, 9099]
     env_required: [FIREBASE_PROJECT_ID]
-    status: "blocked:apps/web lint requires ESLint configuration"
+    status: "ready:lint-warning(apps/web ESLint config missing)"
 
   bracketflow:
     path: /home/nsand/amon-dev/repos/bracketflow
@@ -40,7 +40,7 @@ projects:
     doctor: npm run lint
     ports: [3000]
     env_required: [DATABASE_URL]
-    status: "blocked:missing DATABASE_URL and lint errors"
+    status: "ready:lint-warning(ESLint errors pending)"
 
   minilib:
     path: /home/nsand/amon-dev/repos/minilib

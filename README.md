@@ -14,8 +14,29 @@ Son dos CLIs distintos:
 - `amon-agents` es el orquestador TypeScript de agentes IA (`run`, `audit`,
   `scan`, `push`) y vive en su propio repositorio.
 
-No se fusionan. Una integración futura podrá hacer que `amon` resuelva un
-proyecto y delegue en `amon-agents`; `audit` y `scan` no se implementan aquí.
+No se fusionan. `amon` resuelve el proyecto en el manifiesto y delega el trabajo
+de IA al proceso externo `amon-agents`; no importa ni copia su código.
+
+## Contrato porcelain/plumbing
+
+| Comando `amon` | Delega a `amon-agents` | Notas |
+|---|---|---|
+| `amon audit <slug>` | `amon-agents audit --repo <path>` | Auditoría del proyecto resuelto |
+| `amon scan <slug>` | `amon-agents scan --repo <path>` | Escaneo del proyecto resuelto |
+| `amon agents:status` | `amon-agents status` | Estado global del motor de agentes |
+| `amon agents:doctor` | `amon-agents doctor` | Diagnóstico del entorno de agentes IA |
+
+El proyecto plumbing `amon-agents` también se resuelve desde el manifiesto. La
+delegación valida su bin declarado, usa su runtime mediante mise y ejecuta
+`npm exec --offline -- amon-agents` con un PATH Linux saneado. Esto evita tomar
+por accidente un binario homónimo instalado en Windows bajo `/mnt/c`.
+
+Los namespaces son deliberados:
+
+- `amon doctor` diagnostica el workspace, sus runtimes y proyectos.
+- `amon agents:doctor` diagnostica proveedores y dependencias de agentes IA.
+- `amon status` muestra procesos de desarrollo gestionados por `amon`.
+- `amon agents:status` muestra el estado global de `amon-agents`.
 
 ## Dependencia YAML
 
@@ -126,6 +147,30 @@ Ver procesos gestionados que siguen vivos:
 amon status
 ```
 
+Auditar un proyecto mediante `amon-agents`:
+
+```bash
+amon audit bracketflow
+```
+
+Escanear un proyecto, independientemente de su runtime:
+
+```bash
+amon scan amon_erp
+```
+
+Consultar el estado global del motor de agentes:
+
+```bash
+amon agents:status
+```
+
+Diagnosticar el entorno de agentes IA:
+
+```bash
+amon agents:doctor
+```
+
 Liberar modelos cargados por Ollama y detener todos los procesos gestionados por
 `amon`, sin tocar juegos, Windows ni servicios del sistema:
 
@@ -144,6 +189,8 @@ amon help
 - PIDs: `~/.amon/run/<proyecto>.pid`
 - Logs: `~/.amon/log/<proyecto>.log`
 - Eventos append-only: `~/.amon/events.jsonl`
+- Las delegaciones registran `agents:<comando>`, slug y resultado en el mismo
+  archivo de eventos.
 - `AMON_STATE_DIR` permite usar otra ubicación de estado.
 - Los chequeos de entorno solo comprueban la existencia de `.env` o `.env.local`.
   No leen ni imprimen su contenido ni valores de credenciales.
