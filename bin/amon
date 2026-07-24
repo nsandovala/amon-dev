@@ -536,9 +536,11 @@ snapshot_running_projects() {
     fi
   done
 
-  write_slug_array_file "$AMON_GAMING_SNAPSHOT" "${running_slugs[@]}" || return 1
-  GAMING_SNAPSHOT_COUNT=${#running_slugs[@]}
-  out_ok "Snapshot pre-gaming escrito: $AMON_GAMING_SNAPSHOT ($GAMING_SNAPSHOT_COUNT proyectos)"
+  if [ "${#running_slugs[@]}" -gt 0 ]; then
+    write_slug_array_file "$AMON_GAMING_SNAPSHOT" "${running_slugs[@]}" || return 1
+  else
+    write_slug_array_file "$AMON_GAMING_SNAPSHOT" || return 1
+  fi
 }
 
 release_ollama_models() {
