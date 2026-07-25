@@ -536,13 +536,16 @@ snapshot_running_projects() {
     fi
   done
 
-  if [ "${#running_slugs[@]}" -gt 0 ]; then
+  GAMING_SNAPSHOT_COUNT=${#running_slugs[@]}
+
+  if [ "$GAMING_SNAPSHOT_COUNT" -gt 0 ]; then
     write_slug_array_file "$AMON_GAMING_SNAPSHOT" "${running_slugs[@]}" || return 1
   else
     write_slug_array_file "$AMON_GAMING_SNAPSHOT" || return 1
   fi
-}
 
+  out_ok "Snapshot pre-gaming escrito: $AMON_GAMING_SNAPSHOT ($GAMING_SNAPSHOT_COUNT proyectos)"
+}
 release_ollama_models() {
   local response
   local model
